@@ -51,7 +51,6 @@ import org.apache.parquet.format.CompressionCodec;
 import org.joda.time.DateTimeZone;
 import org.roaringbitmap.longlong.LongBitmapDataProvider;
 import org.roaringbitmap.longlong.Roaring64Bitmap;
-import org.roaringbitmap.longlong.Roaring64NavigableMap;
 
 import java.io.Closeable;
 import java.io.IOException;
@@ -335,13 +334,7 @@ public class DeltaLakeMergeSink
 
         fileDeletions.forEach((path, deletion) -> {
             if (deletionVectorEnabled) {
-                Roaring64NavigableMap pastDeletionVectors = loadDeletionVectors(Location.of(path.toStringUtf8()));
-                if (isNoRowsRetained(path.toStringUtf8(), pastDeletionVectors, deletion)) {
-                    fragments.add(onlySourceFile(path.toStringUtf8(), deletion));
-                }
-                else {
-                    fragments.add(writeDeletionVector(path.toStringUtf8(), pastDeletionVectors, deletion));
-                }
+                fragments.add(writeMergeResult(path, deletion));
             }
             else {
                 fragments.addAll(rewriteFile(path.toStringUtf8(), deletion));
@@ -361,7 +354,34 @@ public class DeltaLakeMergeSink
         return completedFuture(fragments);
     }
 
-    private Slice writeDeletionVector(String sourcePath, Roaring64NavigableMap pastDeletionVectors, FileDeletion deletion)
+    private Slice writeMergeResult(Slice path, FileDeletion deletion)
+    {
+        Roaring64Bitmap pastDeletionVectors = loadDeletionVectors(Location.of(path.toStringUtf8()));
+
+        Roaring64Bitmap deletedRows = new Roaring64Bitmap();
+        deletedRows.or(pastDeletionVectors);
+        deletedRows.or(deletion.rowsDeletedByDelete());
+        deletedRows.or(deletion.rowsDeletedByUpdate());
+
+        TrinoInputFile inputFile = fileSystem.newInputFile(Location.of(path.toStringUtf8()));
+        try (ParquetDataSource dataSource = new TrinoParquetDataSource(inputFile, parquetReaderOptions, fileFormatDataSourceStats)) {
+            ParquetMetadata parquetMetadata = MetadataReader.readFooter(dataSource, Optional.empty());
+            long rowCount = parquetMetadata.getBlocks().stream().map(BlockMetadata::rowCount).mapToLong(Long::longValue).sum();
+            Roaring64Bitmap deletionVectorForWrite = new Roaring64Bitmap();
+            deletionVectorForWrite.addRange(0, rowCount);
+            deletionVectorForWrite.andNot(deletedRows);
+            if (deletionVectorForWrite.isEmpty()) {
+                // No rows are retained in the file, so we don't need to write deletion vectors.
+                return onlySourceFile(path.toStringUtf8(), deletion);
+            }
+            return writeDeletionVector(path.toStringUtf8(), deletedRows, deletion, parquetMetadata, rowCount);
+        }
+        catch (IOException e) {
+            throw new TrinoException(DELTA_LAKE_FILESYSTEM_ERROR, "Error reading Parquet file: " + path, e);
+        }
+    }
+
+    private Slice writeDeletionVector(String sourcePath, Roaring64Bitmap deletedRows, FileDeletion deletion, ParquetMetadata parquetMetadata, long rowCount)
     {
         String tablePath = rootTableLocation.toString();
         Location sourceLocation = Location.of(sourcePath);
@@ -369,17 +389,14 @@ public class DeltaLakeMergeSink
 
         DeletionVectorEntry deletionVectorEntry;
         try {
-            deletionVectorEntry = writeDeletionVectors(fileSystem, rootTableLocation, pastDeletionVectors, deletion.rowsDeletedByDelete, deletion.rowsDeletedByUpdate);
+            deletionVectorEntry = writeDeletionVectors(fileSystem, rootTableLocation, deletedRows);
         }
         catch (IOException e) {
             throw new TrinoException(DELTA_LAKE_BAD_WRITE, "Unable to write deletion vector file", e);
         }
 
         TrinoInputFile inputFile = fileSystem.newInputFile(sourceLocation);
-        try (ParquetDataSource dataSource = new TrinoParquetDataSource(inputFile, parquetReaderOptions, fileFormatDataSourceStats)) {
-            ParquetMetadata parquetMetadata = MetadataReader.readFooter(dataSource, Optional.empty());
-            long rowCount = parquetMetadata.getBlocks().stream().map(BlockMetadata::rowCount).mapToLong(Long::longValue).sum();
-
+        try {
             DataFileInfo newFileInfo = new DataFileInfo(
                     sourceRelativePath,
                     inputFile.length(),
@@ -482,48 +499,19 @@ public class DeltaLakeMergeSink
         }
     }
 
-    private boolean isNoRowsRetained(String path, Roaring64NavigableMap pastDeletionVectors, FileDeletion deletion)
+    private Roaring64Bitmap loadDeletionVectors(Location path)
     {
-        LongBitmapDataProvider rowsDeletedByDelete = deletion.rowsDeletedByDelete();
-        LongBitmapDataProvider rowsDeletedByUpdate = deletion.rowsDeletedByUpdate();
-        int retainedCount = 0;
-        try (ConnectorPageSource connectorPageSource = createParquetPageSource(Location.of(path)).get()) {
-            long filePosition = 0;
-            while (!connectorPageSource.isFinished()) {
-                Page page = connectorPageSource.getNextPage();
-                if (page == null) {
-                    continue;
-                }
-
-                int positionCount = page.getPositionCount();
-                for (int position = 0; position < positionCount; position++) {
-                    if (!pastDeletionVectors.contains(filePosition) && !rowsDeletedByDelete.contains(filePosition) && !rowsDeletedByUpdate.contains(filePosition)) {
-                        retainedCount++;
-                    }
-                    filePosition++;
-                }
-            }
-        }
-        catch (IOException e) {
-            throw new TrinoException(DELTA_LAKE_FILESYSTEM_ERROR, "Error reading Parquet file: " + path, e);
-        }
-        return retainedCount == 0;
-    }
-
-    private Roaring64NavigableMap loadDeletionVectors(Location path)
-    {
-        Roaring64NavigableMap deletedRows = new Roaring64NavigableMap();
         String relativePath = relativePath(rootTableLocation.toString(), path.toString());
-        if (!deletionVectors.containsKey(relativePath)) {
-            return deletedRows;
+        DeletionVectorEntry deletionVector = deletionVectors.get(relativePath);
+        if (deletionVector == null) {
+            return new Roaring64Bitmap();
         }
         try {
-            deletedRows.or(readDeletionVectors(fileSystem, rootTableLocation, deletionVectors.get(relativePath)));
+            return readDeletionVectors(fileSystem, rootTableLocation, deletionVector);
         }
         catch (IOException e) {
             throw new TrinoException(DELTA_LAKE_FILESYSTEM_ERROR, "Error reading deletion vector file: " + path, e);
         }
-        return deletedRows;
     }
 
     private Optional<DataFileInfo> rewriteParquetFile(Location path, FileDeletion deletion, DeltaLakeWriter fileWriter)
@@ -660,8 +648,8 @@ public class DeltaLakeMergeSink
     private static class FileDeletion
     {
         private final List<String> partitionValues;
-        private final LongBitmapDataProvider rowsDeletedByDelete = new Roaring64Bitmap();
-        private final LongBitmapDataProvider rowsDeletedByUpdate = new Roaring64Bitmap();
+        private final Roaring64Bitmap rowsDeletedByDelete = new Roaring64Bitmap();
+        private final Roaring64Bitmap rowsDeletedByUpdate = new Roaring64Bitmap();
 
         private FileDeletion(List<String> partitionValues)
         {
@@ -675,12 +663,12 @@ public class DeltaLakeMergeSink
             return partitionValues;
         }
 
-        public LongBitmapDataProvider rowsDeletedByDelete()
+        public Roaring64Bitmap rowsDeletedByDelete()
         {
             return rowsDeletedByDelete;
         }
 
-        public LongBitmapDataProvider rowsDeletedByUpdate()
+        public Roaring64Bitmap rowsDeletedByUpdate()
         {
             return rowsDeletedByUpdate;
         }
