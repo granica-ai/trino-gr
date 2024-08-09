@@ -159,6 +159,9 @@ import static io.airlift.concurrent.Threads.threadsNamed;
 import static io.airlift.units.DataSize.Unit.MEGABYTE;
 import static io.trino.memory.context.AggregatedMemoryContext.newSimpleAggregatedMemoryContext;
 import static io.trino.plugin.hive.aws.AwsCurrentRegionHolder.getCurrentRegionFromEC2Metadata;
+import static io.trino.plugin.hive.s3.S3CompositeKey.checkCompositeKey;
+import static io.trino.plugin.hive.s3.S3CompositeKey.compositeKeyToObjectName;
+import static io.trino.plugin.hive.s3.S3CompositeKey.splitCompositeKey;
 import static io.trino.plugin.hive.util.RetryDriver.retry;
 import static java.lang.Math.max;
 import static java.lang.Math.min;
@@ -181,8 +184,7 @@ import static org.apache.hadoop.fs.FSExceptionMessages.STREAM_IS_CLOSED;
 
 public class TrinoS3FileSystem
         extends FileSystem
-        implements FileSystemWithBatchDelete, MemoryAwareFileSystem
-{
+        implements FileSystemWithBatchDelete, MemoryAwareFileSystem {
     public static final String S3_USER_AGENT_PREFIX = "trino.s3.user-agent-prefix";
     public static final String S3_CREDENTIALS_PROVIDER = "trino.s3.credentials-provider";
     public static final String S3_SSE_TYPE = "trino.s3.sse.type";
@@ -241,7 +243,8 @@ public class TrinoS3FileSystem
     private static final Duration BACKOFF_MIN_SLEEP = new Duration(1, SECONDS);
     private static final int HTTP_RANGE_NOT_SATISFIABLE = 416;
     private static final String S3_CUSTOM_SIGNER = "TrinoS3CustomSigner";
-    private static final Set<String> GLACIER_STORAGE_CLASSES = ImmutableSet.of(Glacier.toString(), DeepArchive.toString());
+    private static final Set<String> GLACIER_STORAGE_CLASSES = ImmutableSet.of(Glacier.toString(),
+            DeepArchive.toString());
     private static final MediaType DIRECTORY_MEDIA_TYPE = MediaType.create("application", "x-directory");
     private static final String S3_DEFAULT_ROLE_SESSION_NAME = "trino-session";
     public static final int DELETE_BATCH_SIZE = 1000;
@@ -275,8 +278,7 @@ public class TrinoS3FileSystem
 
     @Override
     public void initialize(URI uri, Configuration conf)
-            throws IOException
-    {
+            throws IOException {
         requireNonNull(uri, "uri is null");
         requireNonNull(conf, "conf is null");
         super.initialize(uri, conf);
@@ -284,8 +286,7 @@ public class TrinoS3FileSystem
 
         try {
             this.uri = new URI(uri.getScheme(), uri.getAuthority(), null, null, null);
-        }
-        catch (URISyntaxException e) {
+        } catch (URISyntaxException e) {
             throw new IllegalArgumentException("Invalid uri: " + uri, e);
         }
         this.workingDirectory = new Path(PATH_SEPARATOR).makeQualified(this.uri, new Path(PATH_SEPARATOR));
@@ -293,19 +294,25 @@ public class TrinoS3FileSystem
         HiveS3Config defaults = new HiveS3Config();
         this.stagingDirectory = new File(conf.get(S3_STAGING_DIRECTORY, defaults.getS3StagingDirectory().getPath()));
         this.maxAttempts = conf.getInt(S3_MAX_CLIENT_RETRIES, defaults.getS3MaxClientRetries()) + 1;
-        this.maxBackoffTime = Duration.valueOf(conf.get(S3_MAX_BACKOFF_TIME, defaults.getS3MaxBackoffTime().toString()));
+        this.maxBackoffTime = Duration
+                .valueOf(conf.get(S3_MAX_BACKOFF_TIME, defaults.getS3MaxBackoffTime().toString()));
         this.maxRetryTime = Duration.valueOf(conf.get(S3_MAX_RETRY_TIME, defaults.getS3MaxRetryTime().toString()));
         int maxErrorRetries = conf.getInt(S3_MAX_ERROR_RETRIES, defaults.getS3MaxErrorRetries());
         boolean sslEnabled = conf.getBoolean(S3_SSL_ENABLED, defaults.isS3SslEnabled());
-        Duration connectTimeout = Duration.valueOf(conf.get(S3_CONNECT_TIMEOUT, defaults.getS3ConnectTimeout().toString()));
-        Duration socketTimeout = Duration.valueOf(conf.get(S3_SOCKET_TIMEOUT, defaults.getS3SocketTimeout().toString()));
+        Duration connectTimeout = Duration
+                .valueOf(conf.get(S3_CONNECT_TIMEOUT, defaults.getS3ConnectTimeout().toString()));
+        Duration socketTimeout = Duration
+                .valueOf(conf.get(S3_SOCKET_TIMEOUT, defaults.getS3SocketTimeout().toString()));
         int maxConnections = conf.getInt(S3_MAX_CONNECTIONS, defaults.getS3MaxConnections());
-        this.multiPartUploadMinFileSize = conf.getLong(S3_MULTIPART_MIN_FILE_SIZE, defaults.getS3MultipartMinFileSize().toBytes());
-        this.multiPartUploadMinPartSize = conf.getLong(S3_MULTIPART_MIN_PART_SIZE, defaults.getS3MultipartMinPartSize().toBytes());
+        this.multiPartUploadMinFileSize = conf.getLong(S3_MULTIPART_MIN_FILE_SIZE,
+                defaults.getS3MultipartMinFileSize().toBytes());
+        this.multiPartUploadMinPartSize = conf.getLong(S3_MULTIPART_MIN_PART_SIZE,
+                defaults.getS3MultipartMinPartSize().toBytes());
         this.isPathStyleAccess = conf.getBoolean(S3_PATH_STYLE_ACCESS, defaults.isS3PathStyleAccess());
         this.iamRole = conf.get(S3_IAM_ROLE, defaults.getS3IamRole());
         this.externalId = conf.get(S3_EXTERNAL_ID, defaults.getS3ExternalId());
-        this.pinS3ClientToCurrentRegion = conf.getBoolean(S3_PIN_CLIENT_TO_CURRENT_REGION, defaults.isPinS3ClientToCurrentRegion());
+        this.pinS3ClientToCurrentRegion = conf.getBoolean(S3_PIN_CLIENT_TO_CURRENT_REGION,
+                defaults.isPinS3ClientToCurrentRegion());
         verify(!pinS3ClientToCurrentRegion || conf.get(S3_ENDPOINT) == null,
                 "Invalid configuration: either endpoint can be set or S3 client can be pinned to the current region");
         this.sseEnabled = conf.getBoolean(S3_SSE_ENABLED, defaults.isS3SseEnabled());
@@ -315,8 +322,10 @@ public class TrinoS3FileSystem
         String userAgentPrefix = conf.get(S3_USER_AGENT_PREFIX, defaults.getS3UserAgentPrefix());
         this.skipGlacierObjects = conf.getBoolean(S3_SKIP_GLACIER_OBJECTS, defaults.isSkipGlacierObjects());
         this.requesterPaysEnabled = conf.getBoolean(S3_REQUESTER_PAYS_ENABLED, defaults.isRequesterPaysEnabled());
-        this.streamingUploadEnabled = conf.getBoolean(S3_STREAMING_UPLOAD_ENABLED, defaults.isS3StreamingUploadEnabled());
-        this.streamingUploadPartSize = toIntExact(conf.getLong(S3_STREAMING_UPLOAD_PART_SIZE, defaults.getS3StreamingPartSize().toBytes()));
+        this.streamingUploadEnabled = conf.getBoolean(S3_STREAMING_UPLOAD_ENABLED,
+                defaults.isS3StreamingUploadEnabled());
+        this.streamingUploadPartSize = toIntExact(
+                conf.getLong(S3_STREAMING_UPLOAD_PART_SIZE, defaults.getS3StreamingPartSize().toBytes()));
         this.s3StorageClass = conf.getEnum(S3_STORAGE_CLASS, defaults.getS3StorageClass());
         this.s3RoleSessionName = conf.get(S3_ROLE_SESSION_NAME, S3_DEFAULT_ROLE_SESSION_NAME);
 
@@ -364,8 +373,7 @@ public class TrinoS3FileSystem
 
     @Override
     public void close()
-            throws IOException
-    {
+            throws IOException {
         try (Closer closer = Closer.create()) {
             closer.register(this::closeSuper);
             if (credentialsProvider instanceof Closeable closeable) {
@@ -378,39 +386,33 @@ public class TrinoS3FileSystem
 
     @SuppressModernizer
     private void closeSuper()
-            throws IOException
-    {
+            throws IOException {
         super.close();
     }
 
     @Override
-    public String getScheme()
-    {
+    public String getScheme() {
         return uri.getScheme();
     }
 
     @Override
-    public URI getUri()
-    {
+    public URI getUri() {
         return uri;
     }
 
     @Override
-    public Path getWorkingDirectory()
-    {
+    public Path getWorkingDirectory() {
         return workingDirectory;
     }
 
     @Override
-    public void setWorkingDirectory(Path path)
-    {
+    public void setWorkingDirectory(Path path) {
         workingDirectory = path;
     }
 
     @Override
     public FileStatus[] listStatus(Path path)
-            throws IOException
-    {
+            throws IOException {
         STATS.newListStatusCall();
         List<LocatedFileStatus> list = new ArrayList<>();
         RemoteIterator<LocatedFileStatus> iterator = listLocatedStatus(path);
@@ -421,50 +423,44 @@ public class TrinoS3FileSystem
     }
 
     @Override
-    public RemoteIterator<LocatedFileStatus> listFiles(Path path, boolean recursive)
-    {
-        // Either a single level or full listing, depending on the recursive flag, no "directories"
+    public RemoteIterator<LocatedFileStatus> listFiles(Path path, boolean recursive) {
+        // Either a single level or full listing, depending on the recursive flag, no
+        // "directories"
         // included in either path
-        return new S3ObjectsV2RemoteIterator(listPath(path, OptionalInt.empty(), recursive ? ListingMode.RECURSIVE_FILES_ONLY : ListingMode.SHALLOW_FILES_ONLY));
+        return new S3ObjectsV2RemoteIterator(listPath(path, OptionalInt.empty(),
+                recursive ? ListingMode.RECURSIVE_FILES_ONLY : ListingMode.SHALLOW_FILES_ONLY));
     }
 
     @Override
-    public RemoteIterator<LocatedFileStatus> listLocatedStatus(Path path)
-    {
+    public RemoteIterator<LocatedFileStatus> listLocatedStatus(Path path) {
         STATS.newListLocatedStatusCall();
         return new S3ObjectsV2RemoteIterator(listPath(path, OptionalInt.empty(), ListingMode.SHALLOW_ALL));
     }
 
     private static final class S3ObjectsV2RemoteIterator
-            implements RemoteIterator<LocatedFileStatus>
-    {
+            implements RemoteIterator<LocatedFileStatus> {
         private final Iterator<LocatedFileStatus> iterator;
 
-        public S3ObjectsV2RemoteIterator(Iterator<LocatedFileStatus> iterator)
-        {
+        public S3ObjectsV2RemoteIterator(Iterator<LocatedFileStatus> iterator) {
             this.iterator = requireNonNull(iterator, "iterator is null");
         }
 
         @Override
         public boolean hasNext()
-                throws IOException
-        {
+                throws IOException {
             try {
                 return iterator.hasNext();
-            }
-            catch (AmazonClientException e) {
+            } catch (AmazonClientException e) {
                 throw new IOException(e);
             }
         }
 
         @Override
         public LocatedFileStatus next()
-                throws IOException
-        {
+                throws IOException {
             try {
                 return iterator.next();
-            }
-            catch (AmazonClientException e) {
+            } catch (AmazonClientException e) {
                 throw new IOException(e);
             }
         }
@@ -472,8 +468,7 @@ public class TrinoS3FileSystem
 
     @Override
     public FileStatus getFileStatus(Path path)
-            throws IOException
-    {
+            throws IOException {
         if (path.getName().isEmpty()) {
             // the bucket root requires special handling
             if (getS3ObjectMetadata(path) != null) {
@@ -495,7 +490,8 @@ public class TrinoS3FileSystem
 
         return new FileStatus(
                 getObjectSize(path, metadata),
-                // Some directories (e.g. uploaded through S3 GUI) return a charset in the Content-Type header
+                // Some directories (e.g. uploaded through S3 GUI) return a charset in the
+                // Content-Type header
                 MediaType.parse(metadata.getContentType()).is(DIRECTORY_MEDIA_TYPE),
                 1,
                 BLOCK_SIZE.toBytes(),
@@ -504,12 +500,12 @@ public class TrinoS3FileSystem
     }
 
     private long getObjectSize(Path path, ObjectMetadata metadata)
-            throws IOException
-    {
+            throws IOException {
         Map<String, String> userMetadata = metadata.getUserMetadata();
         String length = userMetadata.get(UNENCRYPTED_CONTENT_LENGTH);
         if (userMetadata.containsKey(SERVER_SIDE_ENCRYPTION) && length == null) {
-            throw new IOException(format("%s header is not set on an encrypted object: %s", UNENCRYPTED_CONTENT_LENGTH, path));
+            throw new IOException(
+                    format("%s header is not set on an encrypted object: %s", UNENCRYPTED_CONTENT_LENGTH, path));
         }
 
         if (length != null) {
@@ -517,7 +513,8 @@ public class TrinoS3FileSystem
         }
 
         long reportedObjectSize = metadata.getContentLength();
-        // x-amz-unencrypted-content-length was not set, infer length for cse-kms encrypted objects by reading the tail until EOF
+        // x-amz-unencrypted-content-length was not set, infer length for cse-kms
+        // encrypted objects by reading the tail until EOF
         if (s3 instanceof AmazonS3Encryption && "kms".equalsIgnoreCase(userMetadata.get(CRYPTO_KEYWRAP_ALGORITHM))) {
             try (FSDataInputStream in = open(path, FSDataInputStreamTail.MAX_SUPPORTED_PADDING_BYTES + 1)) {
                 return FSDataInputStreamTail.readTailForFileSize(path.toString(), reportedObjectSize, in);
@@ -527,39 +524,39 @@ public class TrinoS3FileSystem
     }
 
     @Override
-    public FSDataInputStream open(Path path, int bufferSize)
-    {
+    public FSDataInputStream open(Path path, int bufferSize) {
         return new FSDataInputStream(
                 new BufferedFSInputStream(
-                        new TrinoS3InputStream(s3, getBucketName(uri), path, requesterPaysEnabled, maxAttempts, maxBackoffTime, maxRetryTime),
+                        new TrinoS3InputStream(s3, getBucketName(uri), path, requesterPaysEnabled, maxAttempts,
+                                maxBackoffTime, maxRetryTime),
                         bufferSize));
     }
 
     @Override
-    public FSDataOutputStream create(Path path, FsPermission permission, boolean overwrite, int bufferSize, short replication, long blockSize, Progressable progress)
-            throws IOException
-    {
-        // Ignore the overwrite flag, since Trino Hive connector *usually* writes to unique file names.
+    public FSDataOutputStream create(Path path, FsPermission permission, boolean overwrite, int bufferSize,
+            short replication, long blockSize, Progressable progress)
+            throws IOException {
+        // Ignore the overwrite flag, since Trino Hive connector *usually* writes to
+        // unique file names.
         // Checking for file existence is thus an unnecessary, expensive operation.
         return new FSDataOutputStream(createOutputStream(path, newSimpleAggregatedMemoryContext()), statistics);
     }
 
     @Override
     public OutputStream create(Path path, AggregatedMemoryContext aggregatedMemoryContext)
-            throws IOException
-    {
+            throws IOException {
         return new FSDataOutputStream(createOutputStream(path, aggregatedMemoryContext), statistics);
     }
 
     private OutputStream createOutputStream(Path path, AggregatedMemoryContext memoryContext)
-            throws IOException
-    {
+            throws IOException {
         String bucketName = getBucketName(uri);
         String key = keyFromPath(qualifiedPath(path));
 
         if (streamingUploadEnabled) {
             Supplier<String> uploadIdFactory = () -> initMultipartUpload(bucketName, key).getUploadId();
-            return new TrinoS3StreamingOutputStream(s3, bucketName, key, this::customizePutObjectRequest, uploadIdFactory, uploadExecutor, streamingUploadPartSize, memoryContext);
+            return new TrinoS3StreamingOutputStream(s3, bucketName, key, this::customizePutObjectRequest,
+                    uploadIdFactory, uploadExecutor, streamingUploadPartSize, memoryContext);
         }
 
         if (!stagingDirectory.exists()) {
@@ -569,24 +566,22 @@ public class TrinoS3FileSystem
             throw new IOException("Configured staging path is not a directory: " + stagingDirectory);
         }
         File tempFile = createTempFile(stagingDirectory.toPath(), "trino-s3-", ".tmp").toFile();
-        return new TrinoS3StagingOutputStream(s3, bucketName, key, tempFile, this::customizePutObjectRequest, multiPartUploadMinFileSize, multiPartUploadMinPartSize);
+        return new TrinoS3StagingOutputStream(s3, bucketName, key, tempFile, this::customizePutObjectRequest,
+                multiPartUploadMinFileSize, multiPartUploadMinPartSize);
     }
 
     @Override
-    public FSDataOutputStream append(Path f, int bufferSize, Progressable progress)
-    {
+    public FSDataOutputStream append(Path f, int bufferSize, Progressable progress) {
         throw new UnsupportedOperationException("append");
     }
 
     @Override
     public boolean rename(Path src, Path dst)
-            throws IOException
-    {
+            throws IOException {
         boolean srcDirectory;
         try {
             srcDirectory = directory(src);
-        }
-        catch (FileNotFoundException e) {
+        } catch (FileNotFoundException e) {
             return false;
         }
 
@@ -597,8 +592,7 @@ public class TrinoS3FileSystem
             }
             // move source under destination directory
             dst = new Path(dst, src.getName());
-        }
-        catch (FileNotFoundException e) {
+        } catch (FileNotFoundException e) {
             // destination does not exist
         }
 
@@ -611,10 +605,10 @@ public class TrinoS3FileSystem
                 rename(file.getPath(), new Path(dst, file.getPath().getName()));
             }
             deleteObject(keyFromPath(src) + DIRECTORY_SUFFIX);
-        }
-        else {
-            s3.copyObject(new CopyObjectRequest(getBucketName(uri), keyFromPath(src), getBucketName(uri), keyFromPath(dst))
-                    .withRequesterPays(requesterPaysEnabled));
+        } else {
+            s3.copyObject(
+                    new CopyObjectRequest(getBucketName(uri), keyFromPath(src), getBucketName(uri), keyFromPath(dst))
+                            .withRequesterPays(requesterPaysEnabled));
             delete(src, true);
         }
 
@@ -623,38 +617,36 @@ public class TrinoS3FileSystem
 
     @Override
     public boolean delete(Path path, boolean recursive)
-            throws IOException
-    {
+            throws IOException {
         String key = keyFromPath(path);
         if (recursive) {
             DeletePrefixResult deletePrefixResult;
             try {
                 deletePrefixResult = deletePrefix(path);
-            }
-            catch (AmazonClientException e) {
+            } catch (AmazonClientException e) {
                 throw new IOException("Failed to delete paths with the prefix path " + path, e);
             }
             if (deletePrefixResult == DeletePrefixResult.NO_KEYS_FOUND) {
-                // If the provided key is not a "directory" prefix, attempt to delete the object with the specified key
+                // If the provided key is not a "directory" prefix, attempt to delete the object
+                // with the specified key
                 deleteObject(key);
-            }
-            else if (deletePrefixResult == DeletePrefixResult.DELETE_KEYS_FAILURE) {
+            } else if (deletePrefixResult == DeletePrefixResult.DELETE_KEYS_FAILURE) {
                 return false;
             }
             deleteObject(key + DIRECTORY_SUFFIX);
-        }
-        else {
+        } else {
             Iterator<ListObjectsV2Result> listingsIterator = listObjects(path, OptionalInt.of(2), true);
-            Iterator<String> objectKeysIterator = Iterators.concat(Iterators.transform(listingsIterator, TrinoS3FileSystem::keysFromRecursiveListing));
+            Iterator<String> objectKeysIterator = Iterators
+                    .concat(Iterators.transform(listingsIterator, TrinoS3FileSystem::keysFromRecursiveListing));
             if (objectKeysIterator.hasNext()) {
                 String childKey = objectKeysIterator.next();
                 if (!Objects.equals(childKey, key + PATH_SEPARATOR) || objectKeysIterator.hasNext()) {
                     throw new IOException("Directory " + path + " is not empty");
                 }
                 deleteObject(childKey);
-            }
-            else {
-                // Avoid deleting the bucket in case that the provided path points to the bucket root
+            } else {
+                // Avoid deleting the bucket in case that the provided path points to the bucket
+                // root
                 if (!key.isEmpty()) {
                     deleteObject(key);
                 }
@@ -664,11 +656,11 @@ public class TrinoS3FileSystem
         return true;
     }
 
-    private DeletePrefixResult deletePrefix(Path prefix)
-    {
+    private DeletePrefixResult deletePrefix(Path prefix) {
         String bucketName = getBucketName(uri);
         Iterator<ListObjectsV2Result> listings = listObjects(prefix, OptionalInt.empty(), true);
-        Iterator<String> objectKeys = Iterators.concat(Iterators.transform(listings, TrinoS3FileSystem::keysFromRecursiveListing));
+        Iterator<String> objectKeys = Iterators
+                .concat(Iterators.transform(listings, TrinoS3FileSystem::keysFromRecursiveListing));
         Iterator<List<String>> objectKeysBatches = Iterators.partition(objectKeys, DELETE_BATCH_SIZE);
         if (!objectKeysBatches.hasNext()) {
             return DeletePrefixResult.NO_KEYS_FOUND;
@@ -682,8 +674,7 @@ public class TrinoS3FileSystem
                         .withKeys(objectKeysBatch)
                         .withRequesterPays(requesterPaysEnabled)
                         .withQuiet(true));
-            }
-            catch (AmazonS3Exception e) {
+            } catch (AmazonS3Exception e) {
                 log.debug(e, "Failed to delete objects from the bucket %s under the prefix '%s'", bucketName, prefix);
                 allKeysDeleted = false;
             }
@@ -693,8 +684,7 @@ public class TrinoS3FileSystem
     }
 
     @VisibleForTesting
-    static Iterator<String> keysFromRecursiveListing(ListObjectsV2Result listing)
-    {
+    static Iterator<String> keysFromRecursiveListing(ListObjectsV2Result listing) {
         checkState(
                 listing.getCommonPrefixes() == null || listing.getCommonPrefixes().isEmpty(),
                 "No common prefixes should be present when listing without a path delimiter");
@@ -703,46 +693,43 @@ public class TrinoS3FileSystem
     }
 
     private boolean directory(Path path)
-            throws IOException
-    {
+            throws IOException {
         return getFileStatus(path).isDirectory();
     }
 
-    private boolean deleteObject(String key)
-    {
+    private boolean deleteObject(String key) {
         try {
-            DeleteObjectRequest deleteObjectRequest = new DeleteObjectRequest(getBucketName(uri), key);
+            DeleteObjectRequest deleteObjectRequest = new DeleteObjectRequest(getBucketName(uri),
+                    compositeKeyToObjectName(key));
             if (requesterPaysEnabled) {
-                // TODO use deleteObjectRequest.setRequesterPays() when https://github.com/aws/aws-sdk-java/issues/1219 is fixed
-                // currently the method exists, but is ineffective (doesn't set the required HTTP header)
+                // TODO use deleteObjectRequest.setRequesterPays() when
+                // https://github.com/aws/aws-sdk-java/issues/1219 is fixed
+                // currently the method exists, but is ineffective (doesn't set the required
+                // HTTP header)
                 deleteObjectRequest.putCustomRequestHeader(Headers.REQUESTER_PAYS_HEADER, Constants.REQUESTER_PAYS);
             }
 
             s3.deleteObject(deleteObjectRequest);
             return true;
-        }
-        catch (AmazonClientException e) {
+        } catch (AmazonClientException e) {
             return false;
         }
     }
 
     @Override
     public void deleteFiles(Collection<Path> paths)
-            throws IOException
-    {
+            throws IOException {
         try {
             Iterable<List<Path>> partitions = Iterables.partition(paths, DELETE_BATCH_SIZE);
             for (List<Path> currentBatch : partitions) {
                 deletePaths(currentBatch);
             }
-        }
-        catch (AmazonClientException e) {
+        } catch (AmazonClientException e) {
             throw new IOException("Exception while batch deleting paths", e);
         }
     }
 
-    private void deletePaths(List<Path> paths)
-    {
+    private void deletePaths(List<Path> paths) {
         List<KeyVersion> keys = paths.stream()
                 .map(TrinoS3FileSystem::keyFromPath)
                 .map(KeyVersion::new)
@@ -756,29 +743,27 @@ public class TrinoS3FileSystem
     }
 
     @Override
-    public boolean mkdirs(Path f, FsPermission permission)
-    {
+    public boolean mkdirs(Path f, FsPermission permission) {
         // no need to do anything for S3
         return true;
     }
 
     /**
-     * Enum representing the valid listing modes. This could be two booleans (recursive, filesOnly) except
-     * that (recursive=true, filesOnly=false) can't be translated directly to a natively supported behavior
+     * Enum representing the valid listing modes. This could be two booleans
+     * (recursive, filesOnly) except
+     * that (recursive=true, filesOnly=false) can't be translated directly to a
+     * natively supported behavior
      */
-    private enum ListingMode
-    {
+    private enum ListingMode {
         SHALLOW_ALL,
         SHALLOW_FILES_ONLY,
         RECURSIVE_FILES_ONLY;
 
-        public boolean isFilesOnly()
-        {
+        public boolean isFilesOnly() {
             return (this == SHALLOW_FILES_ONLY || this == RECURSIVE_FILES_ONLY);
         }
 
-        public boolean isRecursive()
-        {
+        public boolean isRecursive() {
             return this == RECURSIVE_FILES_ONLY;
         }
     }
@@ -786,20 +771,19 @@ public class TrinoS3FileSystem
     /**
      * List all objects rooted at the provided path.
      */
-    private Iterator<LocatedFileStatus> listPath(Path path, OptionalInt initialMaxKeys, ListingMode mode)
-    {
+    private Iterator<LocatedFileStatus> listPath(Path path, OptionalInt initialMaxKeys, ListingMode mode) {
         Iterator<ListObjectsV2Result> listings = listObjects(path, initialMaxKeys, mode.isRecursive());
 
         Iterator<LocatedFileStatus> results = Iterators.concat(Iterators.transform(listings, this::statusFromListing));
         if (mode.isFilesOnly()) {
-            //  Even recursive listing can still contain empty "directory" objects, must filter them out
+            // Even recursive listing can still contain empty "directory" objects, must
+            // filter them out
             results = Iterators.filter(results, LocatedFileStatus::isFile);
         }
         return results;
     }
 
-    private Iterator<ListObjectsV2Result> listObjects(Path path, OptionalInt initialMaxKeys, boolean recursive)
-    {
+    private Iterator<ListObjectsV2Result> listObjects(Path path, OptionalInt initialMaxKeys, boolean recursive) {
         String key = keyFromPath(path);
         if (!key.isEmpty()) {
             key += PATH_SEPARATOR;
@@ -813,11 +797,9 @@ public class TrinoS3FileSystem
                 .withRequesterPays(requesterPaysEnabled);
 
         STATS.newListObjectsCall();
-        return new AbstractSequentialIterator<>(s3.listObjectsV2(request))
-        {
+        return new AbstractSequentialIterator<>(s3.listObjectsV2(request)) {
             @Override
-            protected ListObjectsV2Result computeNext(ListObjectsV2Result previous)
-            {
+            protected ListObjectsV2Result computeNext(ListObjectsV2Result previous) {
                 if (!previous.isTruncated()) {
                     return null;
                 }
@@ -828,8 +810,7 @@ public class TrinoS3FileSystem
         };
     }
 
-    private Iterator<LocatedFileStatus> statusFromListing(ListObjectsV2Result listing)
-    {
+    private Iterator<LocatedFileStatus> statusFromListing(ListObjectsV2Result listing) {
         List<String> prefixes = listing.getCommonPrefixes();
         List<S3ObjectSummary> objects = listing.getObjectSummaries();
         if (prefixes.isEmpty()) {
@@ -843,8 +824,7 @@ public class TrinoS3FileSystem
                 statusFromObjects(objects));
     }
 
-    private Iterator<LocatedFileStatus> statusFromPrefixes(List<String> prefixes)
-    {
+    private Iterator<LocatedFileStatus> statusFromPrefixes(List<String> prefixes) {
         List<LocatedFileStatus> list = new ArrayList<>(prefixes.size());
         for (String prefix : prefixes) {
             Path path = qualifiedPath(new Path(PATH_SEPARATOR + prefix));
@@ -854,10 +834,11 @@ public class TrinoS3FileSystem
         return list.iterator();
     }
 
-    private Iterator<LocatedFileStatus> statusFromObjects(List<S3ObjectSummary> objects)
-    {
-        // NOTE: for encrypted objects, S3ObjectSummary.size() used below is NOT correct,
-        // however, to get the correct size we'd need to make an additional request to get
+    private Iterator<LocatedFileStatus> statusFromObjects(List<S3ObjectSummary> objects) {
+        // NOTE: for encrypted objects, S3ObjectSummary.size() used below is NOT
+        // correct,
+        // however, to get the correct size we'd need to make an additional request to
+        // get
         // user metadata, and in this case it doesn't matter.
         return objects.stream()
                 .filter(object -> !object.getKey().endsWith(PATH_SEPARATOR))
@@ -869,36 +850,34 @@ public class TrinoS3FileSystem
                         1,
                         BLOCK_SIZE.toBytes(),
                         object.getLastModified().getTime(),
-                        qualifiedPath(new Path(PATH_SEPARATOR + object.getKey()))))
+                        qualifiedPath(new Path(PATH_SEPARATOR + S3CompositeKey.makeCompositeKey(object.getKey(),
+                                object.getETag(), "statusFromObjects")))))
                 .map(this::createLocatedFileStatus)
                 .iterator();
     }
 
-    private static boolean isGlacierObject(S3ObjectSummary object)
-    {
+    private static boolean isGlacierObject(S3ObjectSummary object) {
         return GLACIER_STORAGE_CLASSES.contains(object.getStorageClass());
     }
 
-    private static boolean isHadoopFolderMarker(S3ObjectSummary object)
-    {
+    private static boolean isHadoopFolderMarker(S3ObjectSummary object) {
         return object.getKey().endsWith("_$folder$");
     }
 
     /**
-     * This exception is for stopping retries for S3 calls that shouldn't be retried.
-     * For example, "Caused by: com.amazonaws.services.s3.model.AmazonS3Exception: Forbidden (Service: Amazon S3; Status Code: 403 ..."
+     * This exception is for stopping retries for S3 calls that shouldn't be
+     * retried.
+     * For example, "Caused by: com.amazonaws.services.s3.model.AmazonS3Exception:
+     * Forbidden (Service: Amazon S3; Status Code: 403 ..."
      */
     public static class UnrecoverableS3OperationException
-            extends IOException
-    {
-        public UnrecoverableS3OperationException(Path path, Throwable cause)
-        {
+            extends IOException {
+        public UnrecoverableS3OperationException(Path path, Throwable cause) {
             // append the path info to the message
             super(format("%s (Path: %s)", cause, path), cause);
         }
 
-        public UnrecoverableS3OperationException(String bucket, String key, Throwable cause)
-        {
+        public UnrecoverableS3OperationException(String bucket, String key, Throwable cause) {
             // append bucket and key to the message
             super(format("%s (Bucket: %s, Key: %s)", cause, bucket, key));
         }
@@ -906,8 +885,7 @@ public class TrinoS3FileSystem
 
     @VisibleForTesting
     ObjectMetadata getS3ObjectMetadata(Path path)
-            throws IOException
-    {
+            throws IOException {
         String bucketName = getBucketName(uri);
         String key = keyFromPath(path);
         ObjectMetadata s3ObjectMetadata = getS3ObjectMetadata(path, bucketName, key);
@@ -918,8 +896,7 @@ public class TrinoS3FileSystem
     }
 
     private ObjectMetadata getS3ObjectMetadata(Path path, String bucketName, String key)
-            throws IOException
-    {
+            throws IOException {
         try {
             return retry()
                     .maxAttempts(maxAttempts)
@@ -929,10 +906,10 @@ public class TrinoS3FileSystem
                     .run("getS3ObjectMetadata", () -> {
                         try {
                             STATS.newMetadataCall();
-                            return s3.getObjectMetadata(new GetObjectMetadataRequest(bucketName, key)
-                                    .withRequesterPays(requesterPaysEnabled));
-                        }
-                        catch (RuntimeException e) {
+                            return s3.getObjectMetadata(
+                                    new GetObjectMetadataRequest(bucketName, compositeKeyToObjectName(key))
+                                            .withRequesterPays(requesterPaysEnabled));
+                        } catch (RuntimeException e) {
                             STATS.newGetMetadataError();
                             if (e instanceof AmazonServiceException awsException) {
                                 switch (awsException.getStatusCode()) {
@@ -948,47 +925,39 @@ public class TrinoS3FileSystem
                             throw e;
                         }
                     });
-        }
-        catch (InterruptedException | AbortedException e) {
+        } catch (InterruptedException | AbortedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException(e);
-        }
-        catch (Exception e) {
+        } catch (Exception e) {
             throwIfInstanceOf(e, IOException.class);
             throwIfUnchecked(e);
             throw new RuntimeException(e);
         }
     }
 
-    private Path qualifiedPath(Path path)
-    {
+    private Path qualifiedPath(Path path) {
         return path.makeQualified(this.uri, getWorkingDirectory());
     }
 
-    private LocatedFileStatus createLocatedFileStatus(FileStatus status)
-    {
+    private LocatedFileStatus createLocatedFileStatus(FileStatus status) {
         try {
             BlockLocation[] fakeLocation = getFileBlockLocations(status, 0, status.getLen());
             return new LocatedFileStatus(status, fakeLocation);
-        }
-        catch (IOException e) {
+        } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
     }
 
-    private static long lastModifiedTime(ObjectMetadata metadata)
-    {
+    private static long lastModifiedTime(ObjectMetadata metadata) {
         Date date = metadata.getLastModified();
         return (date != null) ? date.getTime() : 0;
     }
 
-    private static boolean keysEqual(Path p1, Path p2)
-    {
+    private static boolean keysEqual(Path p1, Path p2) {
         return keyFromPath(p1).equals(keyFromPath(p2));
     }
 
-    public static String keyFromPath(Path path)
-    {
+    public static String keyFromPath(Path path) {
         checkArgument(path.isAbsolute(), "Path is not absolute: %s", path);
         // hack to use path from fragment -- see IcebergSplitSource#hadoopPath()
         String key = Optional.ofNullable(path.toUri().getFragment())
@@ -1003,9 +972,9 @@ public class TrinoS3FileSystem
         return key;
     }
 
-    private AmazonS3 createAmazonS3Client(Configuration hadoopConfig, ClientConfiguration clientConfig)
-    {
-        Optional<EncryptionMaterialsProvider> encryptionMaterialsProvider = createEncryptionMaterialsProvider(hadoopConfig);
+    private AmazonS3 createAmazonS3Client(Configuration hadoopConfig, ClientConfiguration clientConfig) {
+        Optional<EncryptionMaterialsProvider> encryptionMaterialsProvider = createEncryptionMaterialsProvider(
+                hadoopConfig);
         AmazonS3Builder<? extends AmazonS3Builder<?, ?>, ? extends AmazonS3> clientBuilder;
 
         String signerType = hadoopConfig.get(S3_SIGNER_TYPE);
@@ -1018,8 +987,7 @@ public class TrinoS3FileSystem
             Class<? extends Signer> klass;
             try {
                 klass = Class.forName(signerClass).asSubclass(Signer.class);
-            }
-            catch (ClassNotFoundException e) {
+            } catch (ClassNotFoundException e) {
                 throw new RuntimeException("Signer class not found: " + signerClass, e);
             }
             SignerFactory.registerSigner(S3_CUSTOM_SIGNER, klass);
@@ -1032,8 +1000,7 @@ public class TrinoS3FileSystem
                     .withEncryptionMaterials(encryptionMaterialsProvider.get())
                     .withClientConfiguration(clientConfig)
                     .withMetricsCollector(METRIC_COLLECTOR);
-        }
-        else {
+        } else {
             clientBuilder = AmazonS3Client.builder()
                     .withCredentials(credentialsProvider)
                     .withClientConfiguration(clientConfig)
@@ -1059,8 +1026,7 @@ public class TrinoS3FileSystem
         if (endpoint != null) {
             clientBuilder.setEndpointConfiguration(new EndpointConfiguration(endpoint, region));
             regionOrEndpointSet = true;
-        }
-        else if (region != null) {
+        } else if (region != null) {
             clientBuilder.setRegion(region);
             regionOrEndpointSet = true;
         }
@@ -1077,8 +1043,7 @@ public class TrinoS3FileSystem
         return clientBuilder.build();
     }
 
-    private static Optional<EncryptionMaterialsProvider> createEncryptionMaterialsProvider(Configuration hadoopConfig)
-    {
+    private static Optional<EncryptionMaterialsProvider> createEncryptionMaterialsProvider(Configuration hadoopConfig) {
         String kmsKeyId = hadoopConfig.get(S3_KMS_KEY_ID);
         if (kmsKeyId != null) {
             return Optional.of(new KMSEncryptionMaterialsProvider(kmsKeyId));
@@ -1092,20 +1057,19 @@ public class TrinoS3FileSystem
         try {
             Object instance = Class.forName(empClassName).getConstructor().newInstance();
             if (!(instance instanceof EncryptionMaterialsProvider emp)) {
-                throw new RuntimeException("Invalid encryption materials provider class: " + instance.getClass().getName());
+                throw new RuntimeException(
+                        "Invalid encryption materials provider class: " + instance.getClass().getName());
             }
             if (emp instanceof Configurable configurable) {
                 configurable.setConf(hadoopConfig);
             }
             return Optional.of(emp);
-        }
-        catch (ReflectiveOperationException e) {
+        } catch (ReflectiveOperationException e) {
             throw new RuntimeException("Unable to load or create S3 encryption materials provider: " + empClassName, e);
         }
     }
 
-    private AWSCredentialsProvider createAwsCredentialsProvider(URI uri, Configuration conf)
-    {
+    private AWSCredentialsProvider createAwsCredentialsProvider(URI uri, Configuration conf) {
         // credentials embedded in the URI take precedence and are used alone
         Optional<AWSCredentials> credentials = getEmbeddedAwsCredentials(uri);
         if (credentials.isPresent()) {
@@ -1133,13 +1097,11 @@ public class TrinoS3FileSystem
             String region;
             if (!isNullOrEmpty(stsRegionOverride)) {
                 region = stsRegionOverride;
-            }
-            else {
+            } else {
                 DefaultAwsRegionProviderChain regionProviderChain = new DefaultAwsRegionProviderChain();
                 try {
                     region = regionProviderChain.getRegion();
-                }
-                catch (SdkClientException ex) {
+                } catch (SdkClientException ex) {
                     log.warn("Falling back to default AWS region %s", US_EAST_1);
                     region = US_EAST_1.getName();
                 }
@@ -1147,8 +1109,7 @@ public class TrinoS3FileSystem
 
             if (!isNullOrEmpty(stsEndpointOverride)) {
                 stsClientBuilder.withEndpointConfiguration(new EndpointConfiguration(stsEndpointOverride, region));
-            }
-            else {
+            } else {
                 stsClientBuilder.withRegion(region);
             }
 
@@ -1161,22 +1122,20 @@ public class TrinoS3FileSystem
         return provider;
     }
 
-    private static AWSCredentialsProvider getCustomAWSCredentialsProvider(URI uri, Configuration conf, String providerClass)
-    {
+    private static AWSCredentialsProvider getCustomAWSCredentialsProvider(URI uri, Configuration conf,
+            String providerClass) {
         try {
             log.debug("Using AWS credential provider %s for URI %s", providerClass, uri);
             return conf.getClassByName(providerClass)
                     .asSubclass(AWSCredentialsProvider.class)
                     .getConstructor(URI.class, Configuration.class)
                     .newInstance(uri, conf);
-        }
-        catch (ReflectiveOperationException e) {
+        } catch (ReflectiveOperationException e) {
             throw new RuntimeException(format("Error creating an instance of %s for URI %s", providerClass, uri), e);
         }
     }
 
-    private static Optional<AWSCredentials> getEmbeddedAwsCredentials(URI uri)
-    {
+    private static Optional<AWSCredentials> getEmbeddedAwsCredentials(URI uri) {
         String userInfo = nullToEmpty(uri.getUserInfo());
         List<String> parts = Splitter.on(':').limit(2).splitToList(userInfo);
         if (parts.size() == 2) {
@@ -1189,8 +1148,7 @@ public class TrinoS3FileSystem
         return Optional.empty();
     }
 
-    private static Optional<AWSCredentials> getAwsCredentials(Configuration conf)
-    {
+    private static Optional<AWSCredentials> getAwsCredentials(Configuration conf) {
         String accessKey = conf.get(S3_ACCESS_KEY);
         String secretKey = conf.get(S3_SECRET_KEY);
 
@@ -1206,8 +1164,7 @@ public class TrinoS3FileSystem
         return Optional.of(new BasicAWSCredentials(accessKey, secretKey));
     }
 
-    private void customizePutObjectRequest(PutObjectRequest request)
-    {
+    private void customizePutObjectRequest(PutObjectRequest request) {
         if (request.getMetadata() == null) {
             request.setMetadata(new ObjectMetadata());
         }
@@ -1226,8 +1183,7 @@ public class TrinoS3FileSystem
         request.setStorageClass(s3StorageClass.getS3StorageClass());
     }
 
-    private InitiateMultipartUploadResult initMultipartUpload(String bucket, String key)
-    {
+    private InitiateMultipartUploadResult initMultipartUpload(String bucket, String key) {
         try {
             return retry()
                     .maxAttempts(maxAttempts)
@@ -1236,7 +1192,8 @@ public class TrinoS3FileSystem
                     .onRetry(STATS::newInitiateMultipartUploadRetry)
                     .run("initiateMultipartUpload", () -> {
                         try {
-                            InitiateMultipartUploadRequest request = new InitiateMultipartUploadRequest(bucket, key)
+                            InitiateMultipartUploadRequest request = new InitiateMultipartUploadRequest(bucket,
+                                    compositeKeyToObjectName(key))
                                     .withObjectMetadata(new ObjectMetadata())
                                     .withCannedACL(s3AclType.getCannedACL())
                                     .withRequesterPays(requesterPaysEnabled)
@@ -1248,42 +1205,39 @@ public class TrinoS3FileSystem
                                         request.setSSEAwsKeyManagementParams(getSseKeyManagementParams());
                                         break;
                                     case S3:
-                                        request.getObjectMetadata().setSSEAlgorithm(ObjectMetadata.AES_256_SERVER_SIDE_ENCRYPTION);
+                                        request.getObjectMetadata()
+                                                .setSSEAlgorithm(ObjectMetadata.AES_256_SERVER_SIDE_ENCRYPTION);
                                         break;
                                 }
                             }
 
                             return s3.initiateMultipartUpload(request);
-                        }
-                        catch (RuntimeException e) {
+                        } catch (RuntimeException e) {
                             STATS.newInitiateMultipartUploadError();
                             if (e instanceof AmazonS3Exception s3Exception) {
                                 switch (s3Exception.getStatusCode()) {
-                                    case HTTP_FORBIDDEN, HTTP_NOT_FOUND, HTTP_BAD_REQUEST -> throw new UnrecoverableS3OperationException(bucket, key, e);
+                                    case HTTP_FORBIDDEN, HTTP_NOT_FOUND, HTTP_BAD_REQUEST ->
+                                        throw new UnrecoverableS3OperationException(bucket, key, e);
                                 }
                             }
                             throw e;
                         }
                     });
-        }
-        catch (InterruptedException | AbortedException e) {
+        } catch (InterruptedException | AbortedException e) {
             Thread.currentThread().interrupt();
             throw new RuntimeException(e);
-        }
-        catch (Exception e) {
+        } catch (Exception e) {
             throwIfUnchecked(e);
             throw new RuntimeException(e);
         }
     }
 
-    private SSEAwsKeyManagementParams getSseKeyManagementParams()
-    {
+    private SSEAwsKeyManagementParams getSseKeyManagementParams() {
         return (sseKmsKeyId != null) ? new SSEAwsKeyManagementParams(sseKmsKeyId) : new SSEAwsKeyManagementParams();
     }
 
     private static class TrinoS3InputStream
-            extends FSInputStream
-    {
+            extends FSInputStream {
         private final AmazonS3 s3;
         private final String bucket;
         private final Path path;
@@ -1298,8 +1252,8 @@ public class TrinoS3FileSystem
         private long streamPosition;
         private long nextReadPosition;
 
-        public TrinoS3InputStream(AmazonS3 s3, String bucket, Path path, boolean requesterPaysEnabled, int maxAttempts, Duration maxBackoffTime, Duration maxRetryTime)
-        {
+        public TrinoS3InputStream(AmazonS3 s3, String bucket, Path path, boolean requesterPaysEnabled, int maxAttempts,
+                Duration maxBackoffTime, Duration maxRetryTime) {
             this.s3 = requireNonNull(s3, "s3 is null");
             this.bucket = requireNonNull(bucket, "bucket is null");
             this.path = requireNonNull(path, "path is null");
@@ -1312,16 +1266,14 @@ public class TrinoS3FileSystem
         }
 
         @Override
-        public void close()
-        {
+        public void close() {
             closed.set(true);
             closeStream();
         }
 
         @Override
         public int read(long position, byte[] buffer, int offset, int length)
-                throws IOException
-        {
+                throws IOException {
             checkClosed();
             if (position < 0) {
                 throw new EOFException(NEGATIVE_SEEK);
@@ -1335,17 +1287,28 @@ public class TrinoS3FileSystem
                 return retry()
                         .maxAttempts(maxAttempts)
                         .exponentialBackoff(BACKOFF_MIN_SLEEP, maxBackoffTime, maxRetryTime, 2.0)
-                        .stopOn(InterruptedException.class, UnrecoverableS3OperationException.class, EOFException.class, AbortedException.class)
+                        .stopOn(InterruptedException.class, UnrecoverableS3OperationException.class, EOFException.class,
+                                AbortedException.class)
                         .onRetry(STATS::newGetObjectRetry)
                         .run("getS3Object", () -> {
                             InputStream stream;
                             try {
-                                GetObjectRequest request = new GetObjectRequest(bucket, keyFromPath(path))
-                                        .withRange(position, (position + length) - 1)
-                                        .withRequesterPays(requesterPaysEnabled);
-                                stream = s3.getObject(request).getObjectContent();
-                            }
-                            catch (RuntimeException e) {
+                                // keyParts [0] is the real name and keyParts[1] is the etag
+                                String key = keyFromPath(path);
+                                if (checkCompositeKey(key)) {
+                                    String[] keyParts = splitCompositeKey(key, "read");
+                                    GetObjectRequest request = new GetObjectRequest(bucket, keyParts[0])
+                                            .withRange(position, (position + length) - 1)
+                                            .withRequesterPays(requesterPaysEnabled)
+                                            .withMatchingETagConstraint(keyParts[1]);
+                                    stream = s3.getObject(request).getObjectContent();
+                                } else {
+                                    GetObjectRequest request = new GetObjectRequest(bucket, key)
+                                            .withRange(position, (position + length) - 1)
+                                            .withRequesterPays(requesterPaysEnabled);
+                                    stream = s3.getObject(request).getObjectContent();
+                                }
+                            } catch (RuntimeException e) {
                                 STATS.newGetObjectError();
                                 if (e instanceof AmazonServiceException s3Exception) {
                                     switch (s3Exception.getStatusCode()) {
@@ -1379,27 +1342,23 @@ public class TrinoS3FileSystem
                                     read += n;
                                 }
                                 return read;
-                            }
-                            catch (Throwable t) {
+                            } catch (Throwable t) {
                                 STATS.newReadError(t);
                                 abortStream(stream);
                                 throw t;
-                            }
-                            finally {
+                            } finally {
                                 STATS.connectionReleased();
                                 stream.close();
                             }
                         });
-            }
-            catch (Exception e) {
+            } catch (Exception e) {
                 throw propagate(e);
             }
         }
 
         @Override
         public void seek(long pos)
-                throws IOException
-        {
+                throws IOException {
             checkClosed();
             if (pos < 0) {
                 throw new EOFException(NEGATIVE_SEEK);
@@ -1410,35 +1369,33 @@ public class TrinoS3FileSystem
         }
 
         @Override
-        public long getPos()
-        {
+        public long getPos() {
             return nextReadPosition;
         }
 
         @Override
-        public int read()
-        {
-            // This stream is wrapped with BufferedInputStream, so this method should never be called
+        public int read() {
+            // This stream is wrapped with BufferedInputStream, so this method should never
+            // be called
             throw new UnsupportedOperationException();
         }
 
         @Override
         public int read(byte[] buffer, int offset, int length)
-                throws IOException
-        {
+                throws IOException {
             checkClosed();
             try {
                 int bytesRead = retry()
                         .maxAttempts(maxAttempts)
                         .exponentialBackoff(BACKOFF_MIN_SLEEP, maxBackoffTime, maxRetryTime, 2.0)
-                        .stopOn(InterruptedException.class, UnrecoverableS3OperationException.class, AbortedException.class)
+                        .stopOn(InterruptedException.class, UnrecoverableS3OperationException.class,
+                                AbortedException.class)
                         .onRetry(STATS::newReadRetry)
                         .run("readStream", () -> {
                             seekStream();
                             try {
                                 return in.read(buffer, offset, length);
-                            }
-                            catch (Exception e) {
+                            } catch (Exception e) {
                                 STATS.newReadError(e);
                                 closeStream();
                                 throw e;
@@ -1450,21 +1407,18 @@ public class TrinoS3FileSystem
                     nextReadPosition += bytesRead;
                 }
                 return bytesRead;
-            }
-            catch (Exception e) {
+            } catch (Exception e) {
                 throw propagate(e);
             }
         }
 
         @Override
-        public boolean seekToNewSource(long targetPos)
-        {
+        public boolean seekToNewSource(long targetPos) {
             return false;
         }
 
         private void seekStream()
-                throws IOException
-        {
+                throws IOException {
             if ((in != null) && (nextReadPosition == streamPosition)) {
                 // already at specified position
                 return;
@@ -1480,8 +1434,7 @@ public class TrinoS3FileSystem
                             streamPosition = nextReadPosition;
                             return;
                         }
-                    }
-                    catch (IOException ignored) {
+                    } catch (IOException ignored) {
                         // will retry by re-opening the stream
                     }
                 }
@@ -1494,8 +1447,7 @@ public class TrinoS3FileSystem
         }
 
         private void openStream()
-                throws IOException
-        {
+                throws IOException {
             if (in == null) {
                 in = openStream(path, nextReadPosition);
                 streamPosition = nextReadPosition;
@@ -1504,22 +1456,31 @@ public class TrinoS3FileSystem
         }
 
         private InputStream openStream(Path path, long start)
-                throws IOException
-        {
+                throws IOException {
             try {
                 return retry()
                         .maxAttempts(maxAttempts)
                         .exponentialBackoff(BACKOFF_MIN_SLEEP, maxBackoffTime, maxRetryTime, 2.0)
-                        .stopOn(InterruptedException.class, UnrecoverableS3OperationException.class, AbortedException.class)
+                        .stopOn(InterruptedException.class, UnrecoverableS3OperationException.class,
+                                AbortedException.class)
                         .onRetry(STATS::newGetObjectRetry)
                         .run("getS3Object", () -> {
                             try {
-                                GetObjectRequest request = new GetObjectRequest(bucket, keyFromPath(path))
-                                        .withRange(start)
-                                        .withRequesterPays(requesterPaysEnabled);
+                                String key = keyFromPath(path);
+                                GetObjectRequest request;
+                                if (checkCompositeKey(key)) {
+                                    String[] keyParts = splitCompositeKey(keyFromPath(path), "openStream");
+                                    request = new GetObjectRequest(bucket, keyParts[0])
+                                            .withRange(start)
+                                            .withRequesterPays(requesterPaysEnabled)
+                                            .withMatchingETagConstraint(keyParts[1]);
+                                } else {
+                                    request = new GetObjectRequest(bucket, key)
+                                            .withRange(start)
+                                            .withRequesterPays(requesterPaysEnabled);
+                                }
                                 return s3.getObject(request).getObjectContent();
-                            }
-                            catch (RuntimeException e) {
+                            } catch (RuntimeException e) {
                                 STATS.newGetObjectError();
                                 if (e instanceof AmazonServiceException awsException) {
                                     switch (awsException.getStatusCode()) {
@@ -1540,14 +1501,12 @@ public class TrinoS3FileSystem
                                 throw e;
                             }
                         });
-            }
-            catch (Exception e) {
+            } catch (Exception e) {
                 throw propagate(e);
             }
         }
 
-        private void closeStream()
-        {
+        private void closeStream() {
             if (in != null) {
                 abortStream(in);
                 in = null;
@@ -1556,31 +1515,26 @@ public class TrinoS3FileSystem
         }
 
         private void checkClosed()
-                throws IOException
-        {
+                throws IOException {
             if (closed.get()) {
                 throw new IOException(STREAM_IS_CLOSED);
             }
         }
 
-        private static void abortStream(InputStream in)
-        {
+        private static void abortStream(InputStream in) {
             try {
                 if (in instanceof S3ObjectInputStream s3ObjectInputStream) {
                     s3ObjectInputStream.abort();
-                }
-                else {
+                } else {
                     in.close();
                 }
-            }
-            catch (IOException | AbortedException ignored) {
+            } catch (IOException | AbortedException ignored) {
                 // thrown if the current thread is in the interrupted state
             }
         }
 
         private static RuntimeException propagate(Exception e)
-                throws IOException
-        {
+                throws IOException {
             if (e instanceof InterruptedException | e instanceof AbortedException) {
                 Thread.currentThread().interrupt();
                 throw new InterruptedIOException();
@@ -1592,8 +1546,7 @@ public class TrinoS3FileSystem
     }
 
     private static class TrinoS3StagingOutputStream
-            extends FilterOutputStream
-    {
+            extends FilterOutputStream {
         private final TransferManager transferManager;
         private final String bucket;
         private final String key;
@@ -1610,8 +1563,7 @@ public class TrinoS3FileSystem
                 Consumer<PutObjectRequest> requestCustomizer,
                 long multiPartUploadMinFileSize,
                 long multiPartUploadMinPartSize)
-                throws IOException
-        {
+                throws IOException {
             super(new BufferedOutputStream(new FileOutputStream(requireNonNull(tempFile, "tempFile is null"))));
 
             transferManager = TransferManagerBuilder.standard()
@@ -1629,8 +1581,7 @@ public class TrinoS3FileSystem
 
         @Override
         public void close()
-                throws IOException
-        {
+                throws IOException {
             if (closed) {
                 return;
             }
@@ -1639,8 +1590,7 @@ public class TrinoS3FileSystem
             try {
                 super.close();
                 uploadObject();
-            }
-            finally {
+            } finally {
                 if (!tempFile.delete()) {
                     log.warn("Could not delete temporary file: %s", tempFile);
                 }
@@ -1650,13 +1600,14 @@ public class TrinoS3FileSystem
         }
 
         private void uploadObject()
-                throws IOException
-        {
+                throws IOException {
             try {
-                log.debug("Starting upload for bucket: %s, key: %s, file: %s, size: %s", bucket, key, tempFile, tempFile.length());
+                String s3Key = compositeKeyToObjectName(key);
+                log.debug("Starting upload for bucket: %s, key: %s, file: %s, size: %s", bucket, s3Key, tempFile,
+                        tempFile.length());
                 STATS.uploadStarted();
 
-                PutObjectRequest request = new PutObjectRequest(bucket, key, tempFile);
+                PutObjectRequest request = new PutObjectRequest(bucket, s3Key, tempFile);
                 requestCustomizer.accept(request);
 
                 Upload upload = transferManager.upload(request);
@@ -1667,29 +1618,24 @@ public class TrinoS3FileSystem
 
                 upload.waitForCompletion();
                 STATS.uploadSuccessful();
-                log.debug("Completed upload for bucket: %s, key: %s", bucket, key);
-            }
-            catch (AmazonClientException e) {
+                log.debug("Completed upload for bucket: %s, key: %s", bucket, s3Key);
+            } catch (AmazonClientException e) {
                 STATS.uploadFailed();
                 throw new IOException(e);
-            }
-            catch (InterruptedException e) {
+            } catch (InterruptedException e) {
                 STATS.uploadFailed();
                 Thread.currentThread().interrupt();
                 throw new InterruptedIOException();
             }
         }
 
-        private ProgressListener createProgressListener(Transfer transfer)
-        {
-            return new ProgressListener()
-            {
+        private ProgressListener createProgressListener(Transfer transfer) {
+            return new ProgressListener() {
                 private ProgressEventType previousType;
                 private double previousTransferred;
 
                 @Override
-                public synchronized void progressChanged(ProgressEvent progressEvent)
-                {
+                public synchronized void progressChanged(ProgressEvent progressEvent) {
                     ProgressEventType eventType = progressEvent.getEventType();
                     if (previousType != eventType) {
                         log.debug("Upload progress event (%s/%s): %s", bucket, key, eventType);
@@ -1707,8 +1653,7 @@ public class TrinoS3FileSystem
     }
 
     private static class TrinoS3StreamingOutputStream
-            extends OutputStream
-    {
+            extends OutputStream {
         private final AmazonS3 s3;
         private final String bucketName;
         private final String key;
@@ -1722,9 +1667,11 @@ public class TrinoS3FileSystem
 
         private boolean closed;
         private boolean failed;
-        // Mutated and read by main thread; mutated just before scheduling upload to background thread (access does not need to be thread safe)
+        // Mutated and read by main thread; mutated just before scheduling upload to
+        // background thread (access does not need to be thread safe)
         private boolean multipartUploadStarted;
-        // Mutated by background thread which does the multipart upload; read by both main thread and background thread;
+        // Mutated by background thread which does the multipart upload; read by both
+        // main thread and background thread;
         // Visibility ensured by memory barrier via inProgressUploadFuture
         private Optional<String> uploadId = Optional.empty();
         private Future<UploadPartResult> inProgressUploadFuture;
@@ -1741,8 +1688,7 @@ public class TrinoS3FileSystem
                 Supplier<String> uploadIdFactory,
                 ExecutorService uploadExecutor,
                 int partSize,
-                AggregatedMemoryContext memoryContext)
-        {
+                AggregatedMemoryContext memoryContext) {
             STATS.uploadStarted();
 
             this.s3 = requireNonNull(s3, "s3 is null");
@@ -1760,8 +1706,7 @@ public class TrinoS3FileSystem
 
         @Override
         public void write(int b)
-                throws IOException
-        {
+                throws IOException {
             ensureExtraBytesCapacity(1);
             flushBuffer(false);
             buffer[bufferSize] = (byte) b;
@@ -1770,8 +1715,7 @@ public class TrinoS3FileSystem
 
         @Override
         public void write(byte[] bytes, int offset, int length)
-                throws IOException
-        {
+                throws IOException {
             while (length > 0) {
                 ensureExtraBytesCapacity(min(partSize - bufferSize, length));
                 int copied = min(buffer.length - bufferSize, length);
@@ -1787,15 +1731,13 @@ public class TrinoS3FileSystem
 
         @Override
         public void flush()
-                throws IOException
-        {
+                throws IOException {
             flushBuffer(false);
         }
 
         @Override
         public void close()
-                throws IOException
-        {
+                throws IOException {
             if (closed) {
                 return;
             }
@@ -1805,8 +1747,7 @@ public class TrinoS3FileSystem
                 try {
                     abortUpload();
                     return;
-                }
-                catch (RuntimeException e) {
+                } catch (RuntimeException e) {
                     throw new IOException(e);
                 }
             }
@@ -1815,23 +1756,20 @@ public class TrinoS3FileSystem
                 flushBuffer(true);
                 memoryContext.close();
                 waitForPreviousUploadFinish();
-            }
-            catch (IOException | RuntimeException e) {
+            } catch (IOException | RuntimeException e) {
                 abortUploadSuppressed(e);
                 throw e;
             }
 
             try {
                 uploadId.ifPresent(this::finishUpload);
-            }
-            catch (RuntimeException e) {
+            } catch (RuntimeException e) {
                 abortUploadSuppressed(e);
                 throw new IOException(e);
             }
         }
 
-        private void ensureExtraBytesCapacity(int extraBytesCapacity)
-        {
+        private void ensureExtraBytesCapacity(int extraBytesCapacity) {
             int totalBytesCapacity = bufferSize + extraBytesCapacity;
             checkArgument(totalBytesCapacity <= partSize);
             if (buffer.length < totalBytesCapacity) {
@@ -1848,8 +1786,7 @@ public class TrinoS3FileSystem
         }
 
         private void flushBuffer(boolean finished)
-                throws IOException
-        {
+                throws IOException {
             // Skip multipart upload if there would only be one part
             if (finished && !multipartUploadStarted) {
                 InputStream in = new ByteArrayInputStream(buffer, 0, bufferSize);
@@ -1858,14 +1795,14 @@ public class TrinoS3FileSystem
                 metadata.setContentLength(bufferSize);
                 metadata.setContentMD5(getMd5AsBase64(buffer, 0, bufferSize));
 
-                PutObjectRequest request = new PutObjectRequest(bucketName, key, in, metadata);
+                PutObjectRequest request = new PutObjectRequest(bucketName, compositeKeyToObjectName(key), in,
+                        metadata);
                 requestCustomizer.accept(request);
 
                 try {
                     s3.putObject(request);
                     return;
-                }
-                catch (AmazonServiceException e) {
+                } catch (AmazonServiceException e) {
                     failed = true;
                     throw new IOException(e);
                 }
@@ -1878,8 +1815,7 @@ public class TrinoS3FileSystem
 
                 if (finished) {
                     this.buffer = null;
-                }
-                else {
+                } else {
                     this.buffer = new byte[0];
                     this.initialBufferSize = partSize;
                     bufferSize = 0;
@@ -1888,8 +1824,7 @@ public class TrinoS3FileSystem
 
                 try {
                     waitForPreviousUploadFinish();
-                }
-                catch (IOException e) {
+                } catch (IOException e) {
                     failed = true;
                     abortUploadSuppressed(e);
                     throw e;
@@ -1900,26 +1835,22 @@ public class TrinoS3FileSystem
         }
 
         private void waitForPreviousUploadFinish()
-                throws IOException
-        {
+                throws IOException {
             if (inProgressUploadFuture == null) {
                 return;
             }
 
             try {
                 inProgressUploadFuture.get();
-            }
-            catch (InterruptedException e) {
+            } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new InterruptedIOException();
-            }
-            catch (ExecutionException e) {
+            } catch (ExecutionException e) {
                 throw new IOException("Streaming upload failed", e);
             }
         }
 
-        private UploadPartResult uploadPage(byte[] data, int length)
-        {
+        private UploadPartResult uploadPage(byte[] data, int length) {
             if (uploadId.isEmpty()) {
                 uploadId = Optional.of(uploadIdFactory.get());
             }
@@ -1927,7 +1858,7 @@ public class TrinoS3FileSystem
             currentPartNumber++;
             UploadPartRequest uploadRequest = new UploadPartRequest()
                     .withBucketName(bucketName)
-                    .withKey(key)
+                    .withKey(compositeKeyToObjectName(key))
                     .withUploadId(uploadId.get())
                     .withPartNumber(currentPartNumber)
                     .withInputStream(new ByteArrayInputStream(data, 0, length))
@@ -1939,8 +1870,7 @@ public class TrinoS3FileSystem
             return partResult;
         }
 
-        private void finishUpload(String uploadId)
-        {
+        private void finishUpload(String uploadId) {
             List<PartETag> etags = parts.stream()
                     .map(UploadPartResult::getPartETag)
                     .collect(toList());
@@ -1949,20 +1879,18 @@ public class TrinoS3FileSystem
             STATS.uploadSuccessful();
         }
 
-        private void abortUpload()
-        {
+        private void abortUpload() {
             STATS.uploadFailed();
 
-            uploadId.ifPresent(id -> s3.abortMultipartUpload(new AbortMultipartUploadRequest(bucketName, key, id)));
+            uploadId.ifPresent(id -> s3.abortMultipartUpload(
+                    new AbortMultipartUploadRequest(bucketName, compositeKeyToObjectName(key), id)));
         }
 
         @SuppressWarnings("ObjectEquality")
-        private void abortUploadSuppressed(Throwable throwable)
-        {
+        private void abortUploadSuppressed(Throwable throwable) {
             try {
                 abortUpload();
-            }
-            catch (Throwable t) {
+            } catch (Throwable t) {
                 if (throwable != t) {
                     throwable.addSuppressed(t);
                 }
@@ -1971,34 +1899,34 @@ public class TrinoS3FileSystem
     }
 
     @VisibleForTesting
-    AmazonS3 getS3Client()
-    {
+    AmazonS3 getS3Client() {
         return s3;
     }
 
     @VisibleForTesting
-    void setS3Client(AmazonS3 client)
-    {
+    void setS3Client(AmazonS3 client) {
         s3 = client;
     }
 
     @VisibleForTesting
-    protected String getBucketName(URI uri)
-    {
+    protected String getBucketName(URI uri) {
         return extractBucketName(uri);
     }
 
     /**
-     * Helper function used to work around the fact that if you use an S3 bucket with an '_' that java.net.URI
-     * behaves differently and sets the host value to null whereas S3 buckets without '_' have a properly
+     * Helper function used to work around the fact that if you use an S3 bucket
+     * with an '_' that java.net.URI
+     * behaves differently and sets the host value to null whereas S3 buckets
+     * without '_' have a properly
      * set host field. '_' is only allowed in S3 bucket names in us-east-1.
      *
      * @param uri The URI from which to extract a host value.
-     * @return The host value where uri.getAuthority() is used when uri.getHost() returns null as long as no UserInfo is present.
-     * @throws IllegalArgumentException If the bucket cannot be determined from the URI.
+     * @return The host value where uri.getAuthority() is used when uri.getHost()
+     *         returns null as long as no UserInfo is present.
+     * @throws IllegalArgumentException If the bucket cannot be determined from the
+     *                                  URI.
      */
-    public static String extractBucketName(URI uri)
-    {
+    public static String extractBucketName(URI uri) {
         if (uri.getHost() != null) {
             return uri.getHost();
         }
@@ -2010,20 +1938,17 @@ public class TrinoS3FileSystem
         throw new IllegalArgumentException("Unable to determine S3 bucket from URI.");
     }
 
-    public static TrinoS3FileSystemStats getFileSystemStats()
-    {
+    public static TrinoS3FileSystemStats getFileSystemStats() {
         return STATS;
     }
 
-    private static String getMd5AsBase64(byte[] data, int offset, int length)
-    {
+    private static String getMd5AsBase64(byte[] data, int offset, int length) {
         @SuppressWarnings("deprecation")
         byte[] md5 = md5().hashBytes(data, offset, length).asBytes();
         return Base64.getEncoder().encodeToString(md5);
     }
 
-    private enum DeletePrefixResult
-    {
+    private enum DeletePrefixResult {
         NO_KEYS_FOUND,
         ALL_KEYS_DELETED,
         DELETE_KEYS_FAILURE
